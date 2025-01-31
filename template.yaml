@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Report Generation POC with SAM
+
+Parameters:
+  DataLakeType:
+    Type: String
+    Default: mock
+    AllowedValues:
+      - mock
+      - real
+    Description: Type of data lake implementation to use
+  DbType:
+    Type: String
+    Default: postgres
+    AllowedValues:
+      - postgres
+      - mssql
+    Description: Type of database to use
+  DbHost:
+    Type: String
+    Description: Database host
+  DbPort:
+    Type: String
+    Description: Database port
+  DbName:
+    Type: String
+    Description: Database name
+  DbUser:
+    Type: String
+    Description: Database user
+  DbPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 29
+    Environment:
+      Variables:
+        DATA_LAKE_TYPE: !Ref DataLakeType
+        DB_TYPE: !Ref DbType
+        DB_HOST: !Ref DbHost
+        DB_PORT: !Ref DbPort
+        DB_NAME: !Ref DbName
+        DB_USER: !Ref DbUser
+        DB_PASSWORD: !Ref DbPassword
+        DATA_BUCKET: !Ref DataBucket
+        EXPORT_QUEUE_URL: !Ref ExportQueue
+
+Resources:
+  # S3 Bucket for Data Lake Exports
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldExports
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # SQS Queue for Export Jobs
+  ExportQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExportDLQ.Arn
+        maxReceiveCount: 3
+
+  ExportDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  GlobalDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: GlobalDependenciesLayer
+      ContentUri: src/layers/global-dependencies
+      RetentionPolicy: Retain
+
+  DatabaseDependencyLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: DatabaseDependencyLayer
+      ContentUri: src/layers/database
+      RetentionPolicy: Retain
+
+  DataDependencyLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: DataDependencyLayer
+      ContentUri: src/layers/data
+      RetentionPolicy: Retain
+
+  # Lambda Functions
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/query-function
+      Handler: dist/src/index.handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /report
+            Method: post
+      Layers:
+        - !Ref GlobalDependenciesLayer
+        - !Ref DatabaseDependencyLayer
+        - !Ref DataDependencyLayer
+      Policies:
+        - VPCAccessPolicy: {}
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ExportQueue.QueueName
+
+  ProcessExportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/process-export
+      Handler: dist/src/index.handler
+      Timeout: 300
+      Layers:
+        - !Ref GlobalDependenciesLayer
+        - !Ref DatabaseDependencyLayer
+      Policies:
+        - VPCAccessPolicy: {}
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ExportQueue.QueueName
+
+  ExportCSVFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/export-csv
+      Handler: dist/src/index.handler
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ExportQueue.Arn
+            BatchSize: 1
+      Layers:
+        - !Ref GlobalDependenciesLayer
+        - !Ref DatabaseDependencyLayer
+        - !Ref DataDependencyLayer
+      Policies:
+        - VPCAccessPolicy: {}
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+
+  # IAM Permissions
+  DataBucketInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessExportFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt DataBucket.Arn
+
+  ApplyNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: S3BucketNotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowBucketNotification
+                Effect: Allow
+                Action: s3:PutBucketNotification
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataBucket}"
+                  - !Sub "arn:aws:s3:::${DataBucket}/*"
+
+  ApplyBucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function to apply S3 bucket notification configuration
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: !GetAtt ApplyNotificationFunctionRole.Arn
+      Timeout: 240
+      Code:
+        ZipFile: |
+          const { S3Client, PutBucketNotificationConfigurationCommand } = require('@aws-sdk/client-s3');
+          const s3Client = new S3Client({});
+          const response = require('cfn-response');
+
+          async function addBucketNotification(bucketName, notificationId, functionArn) {
+            const params = {
+              Bucket: bucketName,
+              NotificationConfiguration: {
+                LambdaFunctionConfigurations: [
+                  {
+                    Id: notificationId,
+                    LambdaFunctionArn: functionArn,
+                    Events: ['s3:ObjectCreated:*'],
+                    Filter: {
+                      Key: {
+                        FilterRules: [
+                          {
+                            Name: 'prefix',
+                            Value: 'exports/'
+                          },
+                          {
+                            Name: 'suffix',
+                            Value: 'data.json'
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            };
+
+            const command = new PutBucketNotificationConfigurationCommand(params);
+            return s3Client.send(command);
+          }
+
+          exports.handler = async (event, context) => {
+            console.log('Received event:', JSON.stringify(event));
+
+            try {
+              if (event.RequestType === 'Delete') {
+                await response.send(event, context, response.SUCCESS);
+                return;
+              }
+
+              const properties = event.ResourceProperties;
+              await addBucketNotification(
+                properties.S3Bucket,
+                properties.NotificationId,
+                properties.FunctionARN
+              );
+
+              await response.send(event, context, response.SUCCESS);
+            } catch (error) {
+              console.error('Error:', error);
+              await response.send(event, context, response.FAILED);
+            }
+          };
+
+  ApplyNotification:
+    Type: Custom::ApplyNotification
+    Properties:
+      ServiceToken: !GetAtt ApplyBucketNotificationFunction.Arn
+      S3Bucket: !Ref DataBucket
+      FunctionARN: !GetAtt ProcessExportFunction.Arn
+      NotificationId: S3ObjectCreatedEvent
+      Version: "2.0"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/
+  DataBucketName:
+    Description: Name of the S3 bucket for data lake exports
+    Value: !Ref DataBucket

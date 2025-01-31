@@ -1,0 +1,12 @@
+{
+  "name": "global-dependencies-layer",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "json2csv": "^6.0.0-alpha.2"
+  }
+}
