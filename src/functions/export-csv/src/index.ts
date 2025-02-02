@@ -1,5 +1,5 @@
 import {SQSEvent, SQSHandler, SQSRecord} from 'aws-lambda';
-import {S3Client, GetObjectCommand, PutObjectCommand} from '@aws-sdk/client-s3';
+import {S3Client, ListObjectsV2Command, PutObjectCommand} from '@aws-sdk/client-s3';
 import {Parser} from 'json2csv';
 import crypto from "crypto";
 
@@ -7,11 +7,28 @@ const s3Client = new S3Client({});
 
 const BUCKET_NAME = process.env.DATA_BUCKET;
 
+const getNextVersion = async (dealerID: string, templateID: string, generationDate: string): Promise<number> => {
+    const prefix = `SSE_${dealerID}/${templateID}/${generationDate}/`;
+    try {
+        const response = await s3Client.send(new ListObjectsV2Command({
+            Bucket: BUCKET_NAME,
+            Prefix: prefix,
+            Delimiter: "/"
+        }));
+
+        const versions = response.CommonPrefixes?.map(prefix => parseInt(prefix.Prefix?.split("/").slice(-2, -1)[0] || "1", 10)).filter(Number.isInteger) || [];
+        return versions.length > 0 ? Math.max(...versions) + 1 : 1;
+    } catch (error) {
+        console.error("Error retrieving versions from S3", error);
+        return 1;
+    }
+};
+
 export const handler: SQSHandler = async (event: SQSEvent): Promise<any> => {
     for (const record of event.Records) {
         try {
             const message = JSON.parse(record.body);
-            const { metadata, data } = message;
+            const {metadata, data} = message;
 
             if (!Array.isArray(data) || data.length === 0) {
                 console.warn('No valid data to process');
@@ -34,7 +51,10 @@ export const handler: SQSHandler = async (event: SQSEvent): Promise<any> => {
                 .slice(0, 15);
             const randomHash = crypto.randomBytes(3).toString('hex');
             const fileName = `${templateID}_${timestamp}_${randomHash}.csv`;
-            const filePath = `SSE_${dealerID}/${templateID}/${generationDate}/${fileName}`;
+
+            const version = await getNextVersion(dealerID, templateID, generationDate);
+
+            const filePath = `SSE_${dealerID}/${templateID}/${generationDate}/${version}/${fileName}`;
 
             const parser = new Parser();
             const csvData = parser.parse(data);
@@ -63,4 +83,4 @@ export const handler: SQSHandler = async (event: SQSEvent): Promise<any> => {
             };
         }
     }
-};
+}
